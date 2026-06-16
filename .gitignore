@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Large medical data & derivatives (keep out of git; track with DVC/rsync instead)
+mr-ct-data/
+derivatives/
+logs/
+*.nii
+*.nii.gz
+
+# Notebooks / experiment tracking
+.ipynb_checkpoints/
+wandb/
+
+# OS
+.DS_Store
+
+# PDFs (local reference docs; not tracked in git)
+*.pdf
+
+*.md
