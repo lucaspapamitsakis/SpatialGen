@@ -13,11 +13,10 @@ logs/
 # Notebooks / experiment tracking
 .ipynb_checkpoints/
 wandb/
+.mplcache/
 
 # OS
 .DS_Store
 
 # PDFs (local reference docs; not tracked in git)
 *.pdf
-
-*.md
