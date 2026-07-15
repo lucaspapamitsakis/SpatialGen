@@ -22,6 +22,7 @@ Key flags:
   --wandb         enable W&B logging (else offline/no-op)
   --wandb-project W&B project (default spatialgen-unet)
   --overfit N     smoke test: train+val on the same N slices, no aug (expect Dice->~1)
+  --resume PATH   resume from a checkpoint (.pt) and train --epochs *more* epochs
   --device        cuda|mps|cpu (default: auto)
   --out-dir       checkpoint dir (default: derivatives/unet_runs/<timestamp>)
 
@@ -184,6 +185,10 @@ def main() -> None:
     ap.add_argument("--wandb-name", default=None)
     ap.add_argument("--overfit", type=int, default=0,
                     help="smoke test: use the same N slices for train+val")
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="resume from a checkpoint (.pt); trains --epochs MORE epochs "
+                         "and continues epoch numbering. Model architecture (channels, "
+                         "dropout) and pos_weight are taken from the checkpoint.")
     ap.add_argument("--out-dir", type=Path, default=None)
     args = ap.parse_args()
 
@@ -202,8 +207,24 @@ def main() -> None:
         train_ds = val_ds = sub
         print(f"[overfit] using {len(sub)} slices for train==val (no augmentation)")
 
+    ckpt = None
+    if args.resume is not None:
+        # weights_only=False: our own checkpoints store a config dict with
+        # pathlib.Path objects, which the (default) weights-only loader rejects.
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        ckpt_cfg = ckpt.get("config", {})
+        # Architecture must match the saved weights, so take it from the checkpoint
+        # (ignoring any --channels/--dropout given on the command line).
+        for k in ("channels", "dropout"):
+            if k in ckpt_cfg and getattr(args, k) != ckpt_cfg[k]:
+                print(f"[resume] overriding --{k} {getattr(args, k)} -> "
+                      f"{ckpt_cfg[k]} (from checkpoint)")
+                setattr(args, k, ckpt_cfg[k])
+
     if args.pos_weight is not None:
         pos_weight = args.pos_weight
+    elif ckpt is not None and ckpt.get("pos_weight") is not None:
+        pos_weight = float(ckpt["pos_weight"])
     elif args.overfit:
         pos_weight = 1.0
     else:
@@ -222,6 +243,21 @@ def main() -> None:
     loss_fn = BCEDiceLoss(pos_weight, args.bce_weight, args.dice_weight).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    start_epoch = 0
+    best_dice = -1.0
+    if ckpt is not None:
+        model.load_state_dict(ckpt["model"])
+        if ckpt.get("optimizer") is not None:
+            opt.load_state_dict(ckpt["optimizer"])
+        else:
+            print("[resume] checkpoint has no optimizer state; Adam moments "
+                  "restart from zero (fine, just a brief warm-up).")
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_dice = float(ckpt.get("val_dice", -1.0))
+        print(f"[resume] loaded {args.resume}  (trained {start_epoch} epochs, "
+              f"prev best val_dice={best_dice:.4f}); training {args.epochs} more "
+              f"-> through epoch {start_epoch + args.epochs}")
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = args.out_dir or (ROOT / "derivatives" / "unet_runs" / stamp)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -234,8 +270,8 @@ def main() -> None:
                          config={**vars(args), "pos_weight": pos_weight,
                                  "n_train": len(train_ds), "n_val": len(val_ds)})
 
-    best_dice = -1.0
-    for epoch in range(1, args.epochs + 1):
+    total_epochs = start_epoch + args.epochs
+    for epoch in range(start_epoch + 1, total_epochs + 1):
         model.train()
         t0 = time.time()
         run_loss = run_bce = run_dice = seen = 0
@@ -256,7 +292,7 @@ def main() -> None:
         val_metrics = evaluate(model, val_loader, loss_fn, device)
         dt = time.time() - t0
 
-        print(f"epoch {epoch:3d}/{args.epochs}  "
+        print(f"epoch {epoch:3d}/{total_epochs}  "
               f"train_loss={train_metrics['loss']:.4f}  "
               f"val_loss={val_metrics['loss']:.4f}  "
               f"val_dice={val_metrics['dice']:.4f}  ({dt:.1f}s)")
@@ -271,12 +307,14 @@ def main() -> None:
 
         if val_metrics["dice"] > best_dice:
             best_dice = val_metrics["dice"]
-            torch.save({"model": model.state_dict(), "epoch": epoch,
+            torch.save({"model": model.state_dict(),
+                        "optimizer": opt.state_dict(), "epoch": epoch,
                         "val_dice": best_dice, "config": vars(args),
                         "pos_weight": pos_weight},
                        out_dir / "best.pt")
 
-    torch.save({"model": model.state_dict(), "epoch": args.epochs,
+    torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
+                "epoch": total_epochs, "val_dice": best_dice,
                 "config": vars(args), "pos_weight": pos_weight},
                out_dir / "last.pt")
     print(f"best val Dice = {best_dice:.4f}")
