@@ -1,14 +1,11 @@
 # SpatialGen — MetaCOG-based Bone-Segmentation Error Correction
 
-A Python-first revamp of the *Bayesian Framework for Segmentation Error
+A Python-first revamp of my *Bayesian Framework for Segmentation Error
 Quantification* project. The goal: predict skull-bone masks from MR scans with an
 Attention U-Net, then run a **MetaCOG-style** localized Bayesian inference loop
 (Pyro) that jointly infers the corrected true mask plus localized
 false-positive / false-negative error maps — using only the U-Net output, never
 the test ground truth.
-
-For scientific rationale, completed-work details, Bouchet/W&B instructions,
-known limitations, and next steps, read **[`PROJECT_HANDOFF.md`](PROJECT_HANDOFF.md)**.
 
 ## Pipeline stages
 
@@ -21,9 +18,11 @@ known limitations, and next steps, read **[`PROJECT_HANDOFF.md`](PROJECT_HANDOFF
 | 2b. Filter low-bone slices | numpy | `scripts/filter_dataset_slices.py` | filtered 2D tensors |
 | 2c. NIfTI inspection export | nibabel | `scripts/npz_to_nii.py` | stacks + original-grid ROI overlays |
 | 3. Attention U-Net | MONAI/PyTorch | `models/unet.py` + `scripts/04_train_unet.py` | validation-selected checkpoint |
-| 3b. Test inference/evaluation | PyTorch | *(todo)* | patient-level metrics + frozen predictions |
-| 4. Class-balanced C-VAE | PyTorch | `models/cvae.py` *(todo)* | anatomical shape prior |
-| 5. Localized MetaCOG inference | Pyro | `inference/bayesian_engine.py` *(todo)* | corrected masks + error maps |
+| 3b. Test inference/evaluation | PyTorch | `scripts/06_run_unet_inference.py` | patient-level metrics + frozen predictions |
+| 4. Anatomical prior | numpy/scipy | `scripts/07_build_bone_atlas.py` | empirical `s_norm`-binned atlas (stands in for the C-VAE) |
+| 4b. Class-balanced C-VAE | PyTorch | `models/cvae.py` *(todo)* | joint shape prior — see handoff §6.7 |
+| 5. MetaCOG inference (global `H`, `M`) | Pyro | `models/metacog.py` + `scripts/08_run_metacog_inference.py` | corrected masks + per-patient error rates |
+| 5b. MetaCOG QC figures | matplotlib | `scripts/09_visualize_metacog.py` | forest plots, traces, paired Dice |
 
 ## Data layout
 

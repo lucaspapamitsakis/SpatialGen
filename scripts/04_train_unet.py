@@ -181,7 +181,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--wandb", action="store_true")
-    ap.add_argument("--wandb-project", default="spatialgen-unet")
+    ap.add_argument("--wandb-project", default="spatial-gen-unet")
     ap.add_argument("--wandb-name", default=None)
     ap.add_argument("--overfit", type=int, default=0,
                     help="smoke test: use the same N slices for train+val")

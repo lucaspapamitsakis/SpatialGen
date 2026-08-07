@@ -21,5 +21,6 @@ wandb/
 # PDFs (local reference docs; not tracked in git)
 *.pdf
 
-# Handoff Document
+# Handoff Documents
 PROJECT_HANDOFF.md
+HANDOFF_*.md
