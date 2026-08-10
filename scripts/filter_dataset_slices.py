@@ -7,8 +7,10 @@ write a new filtered bundle (same format as before).
 
 Why re-pack instead of editing by hand?
   Each `.npz` stores aligned arrays (mr, bone, s_norm, z_index). Dropping a
-  slice means indexing all four arrays together and **recomputing s_norm** so
-  crown = 1.0 and vault base = 0.0 on the retained range.
+  slice means indexing all of those arrays together. `s_norm` is NOT rescaled:
+  it keeps the vertex-anchored values from `03_make_2d_dataset.py`
+  (1.0 = skull vertex, 0.0 = 64 mm below). Dropping upper slices simply truncates
+  the retained range from the top (e.g. max s_norm may become 0.84, not 1.0).
 
 Two ways to choose slices to drop:
 
@@ -87,14 +89,6 @@ def load_exclusions(path: Path, index_base: int) -> dict[str, set[int]]:
     return excluded
 
 
-def recompute_s_norm(z_index: np.ndarray) -> np.ndarray:
-    z_index = z_index.astype(np.int16)
-    if len(z_index) <= 1:
-        return np.ones(len(z_index), dtype=np.float32)
-    lo, hi = int(z_index.min()), int(z_index.max())
-    return ((z_index - lo) / (hi - lo)).astype(np.float32)
-
-
 def decide_drops(
     pid: str,
     bone: np.ndarray,
@@ -135,13 +129,21 @@ def filter_patient(
     if keep.size == 0:
         return {"patient": pid, "status": "all_dropped", "n_before": len(mr), "n_after": 0}
 
-    z_new = z_index[keep]
+    # Keep the original vertex-anchored s_norm for retained slices. Do NOT
+    # rescale to the retained range — that was the old bug that made
+    # s_norm=1.0 mean different anatomy across patients.
     out = {
         "mr": mr[keep],
         "bone": bone[keep],
-        "z_index": z_new.astype(np.int16),
-        "s_norm": recompute_s_norm(z_new),
+        "z_index": z_index[keep].astype(np.int16),
+        "s_norm": s_norm[keep].astype(np.float32),
     }
+    # Optional keys written by a one-time reanchor repair; preserve if present.
+    if "d_mm" in pack.files:
+        out["d_mm"] = pack["d_mm"][keep].astype(np.float32)
+    if "vertex_z" in pack.files:
+        out["vertex_z"] = np.asarray(pack["vertex_z"]).astype(np.int16)
+
     np.savez_compressed(dst, **out)
     return {
         "patient": pid,
@@ -150,6 +152,7 @@ def filter_patient(
         "n_after": int(len(keep)),
         "n_dropped": int(len(drop_indices)),
         "bone_frac_after": round(float(out["bone"].mean()), 4),
+        "s_norm_max": round(float(out["s_norm"].max()), 4),
     }
 
 
