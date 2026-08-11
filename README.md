@@ -2,10 +2,10 @@
 
 A Python-first revamp of my *Bayesian Framework for Segmentation Error
 Quantification* project. The goal: predict skull-bone masks from MR scans with an
-Attention U-Net, then run a **MetaCOG-style** localized Bayesian inference loop
-(Pyro) that jointly infers the corrected true mask plus localized
-false-positive / false-negative error maps — using only the U-Net output, never
-the test ground truth.
+Attention U-Net, then run **MetaCOG-style deterministic Bayesian inference** that
+jointly estimates the corrected true mask plus global or localized false-positive
+/ false-negative error rates — using only the U-Net output, never the test ground
+truth.
 
 ## Pipeline stages
 
@@ -19,10 +19,11 @@ the test ground truth.
 | 2c. NIfTI inspection export | nibabel | `scripts/npz_to_nii.py` | stacks + original-grid ROI overlays |
 | 3. Attention U-Net | MONAI/PyTorch | `models/unet.py` + `scripts/04_train_unet.py` | validation-selected checkpoint |
 | 3b. Test inference/evaluation | PyTorch | `scripts/06_run_unet_inference.py` | patient-level metrics + frozen predictions |
-| 4. Anatomical prior | numpy/scipy | `scripts/07_build_bone_atlas.py` | empirical `s_norm`-binned atlas (stands in for the C-VAE) |
-| 4b. Class-balanced C-VAE | PyTorch | `models/cvae.py` *(todo)* | joint shape prior — see handoff §6.7 |
-| 5. MetaCOG inference (global `H`, `M`) | Pyro | `models/metacog.py` + `scripts/08_run_metacog_inference.py` | corrected masks + per-patient error rates |
-| 5b. MetaCOG QC figures | matplotlib | `scripts/09_visualize_metacog.py` | forest plots, traces, paired Dice |
+| 4. Anatomical prior | numpy/scipy | `scripts/07_build_bone_atlas.py` | empirical `s_norm`-binned atlas baseline |
+| 4b. Conditional C-VAE prior | PyTorch | `models/cvae.py` + `scripts/11_train_cvae.py` + `scripts/12_sample_cvae_prior.py` | soft `P(bone\|z,s_norm)` maps for MetaCOG |
+| 5. MetaCOG grid inference | numpy/scipy | `models/metacog.py` + `scripts/08_run_metacog_inference.py` | global, 8×8-patch, or `s_norm`-stratified rates + corrected masks |
+| 5b. MetaCOG QC figures | matplotlib | `scripts/09_visualize_metacog.py` | posterior/rate maps, height curves, mask panels, paired metrics |
+| 5c. Cross-experiment comparison | numpy/matplotlib | `scripts/10_compare_metacog_experiments.py` | paired bootstrap summaries + poster figure |
 
 ## Data layout
 
@@ -68,7 +69,7 @@ comparable to the generative method — both simply consume one frozen dataset.
 3. Keep the superior ~65 mm of slices (ellipsoidal vault, above orbits/sinuses).
 4. Centre on the head centroid, crop a fixed 180 mm box, resize to 64×64
    (MR bilinear, bone nearest); robust per-volume MR z-score.
-5. Per-slice `s_norm` (crown = 1.0, vault base = 0.0).
+5. Per-slice vertex-anchored `s_norm` (crown = 1.0, 64 mm below crown = 0.0).
 
 ```bash
 .venv/bin/python scripts/03_make_2d_dataset.py --save-thumbnails
@@ -114,19 +115,81 @@ Checkpoints (`best.pt` by val Dice, `last.pt`) and `config.json` land in
 `derivatives/unet_runs/<timestamp>/`. CPU is ~3.5 min/epoch; use CUDA/MPS for
 real runs.
 
-Important: the training script does **not yet evaluate the test set or save test
-predictions**. A separate final inference/evaluation script is the next required
-stage before reporting a baseline or starting MetaCOG inference. The current
-`--augment` option also uses 90-degree rotations; establish a no-augmentation
-baseline or replace these with small-angle rotations for the primary experiment.
+The frozen run `v1.1-20260715-123154` selected epoch 194 at validation Dice
+0.91265. `06_run_unet_inference.py` saves predictions and both mean-slice and
+patient-volume Dice for all frozen splits.
+
+## Stage 4b: s_norm-conditioned C-VAE shape prior
+
+`models/cvae.py` is a 64×64 convolutional VAE conditioned only on vertex-anchored
+`s_norm` (no MR, no U-Net). It outputs soft bone logits; MetaCOG uses Monte Carlo
+averages of `σ(f_θ(z, s_norm))` with `z ~ N(0,I)` as the anatomical prior `p_i`.
+
+Training uses weighted BCE + soft Dice + β·KL, with linear β warm-up. Augmentation
+is **off by default**; `--augment` enables small continuous rotations only (no
+flips). Checkpoints land in `derivatives/cvae_runs/<timestamp>/`.
+
+With `--wandb`, every epoch logs scalar curves (loss / Dice / KL / β / latent
+stats) against epoch. Every `--wandb-image-every` epochs (default 5; also epoch 1
+and the last epoch) uploads reconstruction panels (GT vs recon), prior samples at
+several `s_norm` levels, and Monte Carlo mean prior maps. The same PNGs are saved
+under `derivatives/cvae_runs/<stamp>/panels/`.
+
+```bash
+# Smoke test (expect reconstruction Dice to rise quickly)
+.venv/bin/python scripts/11_train_cvae.py --overfit 16 --epochs 40 --device cpu
+
+# Full train on filtered train split (optional small rotations + W&B)
+.venv/bin/python scripts/11_train_cvae.py --epochs 120 --augment --wandb \
+  --wandb-image-every 5
+
+# Export soft priors for MetaCOG
+.venv/bin/python scripts/12_sample_cvae_prior.py \
+  --checkpoint derivatives/cvae_runs/<stamp>/best.pt --split val --save-qc
+
+# MetaCOG with C-VAE prior instead of the empirical atlas maps
+.venv/bin/python scripts/08_run_metacog_inference.py \
+  --predictions-dir derivatives/unet_predictions/v1.1-20260715-123154 \
+  --split val --locality global \
+  --prior-dir derivatives/cvae_priors/<stamp>/val
+```
+
+## Stage 5: MetaCOG grid experiments
+
+The two-dimensional `P(H,M | U,p)` posterior is integrated deterministically on
+an adaptive logit-space grid. No MCMC chains or Pyro installation are required.
+
+```bash
+PRED=derivatives/unet_predictions/v1.1-20260715-123154
+
+# Develop on validation
+.venv/bin/python scripts/08_run_metacog_inference.py \
+  --predictions-dir "$PRED" --split val --locality global
+.venv/bin/python scripts/08_run_metacog_inference.py \
+  --predictions-dir "$PRED" --split val --locality patch --patch-size 8
+.venv/bin/python scripts/08_run_metacog_inference.py \
+  --predictions-dir "$PRED" --split val --locality snorm
+
+# Visualize one run
+.venv/bin/python scripts/09_visualize_metacog.py \
+  --run-dir derivatives/metacog_runs/v1.1-20260715-123154/global/val
+
+# Compare completed variants on the same split
+.venv/bin/python scripts/10_compare_metacog_experiments.py \
+  --root derivatives/metacog_runs/v1.1-20260715-123154 --split test
+```
+
+Every run reports patient-volume Dice, 3 mm surface Dice, HD95, largest-component
+fraction, probability Brier score, empirical-vs-inferred rate accuracy, performance
+by physical height, changed-pixel fraction, deterministic-grid convergence, and
+runtime. Ground truth enters only after inference for scoring.
 
 ## Current next steps
 
-1. Freeze a scientifically defensible slice-retention policy.
-2. Run the first no-augmentation U-Net baseline on Bouchet with W&B.
-3. Implement patient-level test evaluation and save U-Net predictions.
-4. Implement the `s_norm`-conditioned C-VAE.
-5. Implement localized Pyro inference and compare it with the frozen baseline.
+1. Train the C-VAE on the filtered train split; QC reconstructions and samples.
+2. Export Monte Carlo soft priors and compare MetaCOG (`--prior-dir`) against the
+   frozen atlas baselines without changing the U-Net, masks, split, or threshold.
+3. If MC averaging is still too weak, jointly infer latent `z` with `(H,M)`.
 
 ## Environment
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -84,10 +85,25 @@ def dice_per_slice(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-6) -> np.nd
     return (2 * inter + eps) / (denom + eps)
 
 
+def dice_volume(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-6) -> float:
+    """Hard Dice over a patient's complete retained 3D stack."""
+    inter = float((pred * gt).sum())
+    denom = float(pred.sum() + gt.sum())
+    return (2.0 * inter + eps) / (denom + eps)
+
+
 def ci95(vals: np.ndarray) -> float:
     if vals.size < 2:
         return float("nan")
     return float(1.96 * vals.std(ddof=1) / np.sqrt(vals.size))
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 @torch.no_grad()
@@ -160,64 +176,95 @@ def main() -> None:
         bone = pack["bone"].astype(np.uint8)
         s_norm = pack["s_norm"]
         z_index = pack["z_index"]
+        d_mm = pack["d_mm"] if "d_mm" in pack.files else None
+        vertex_z = pack["vertex_z"] if "vertex_z" in pack.files else None
+
+        if d_mm is not None:
+            expected = 1.0 - d_mm.astype(np.float64) / 64.0
+            if not np.allclose(s_norm, expected, atol=1e-6):
+                raise ValueError(
+                    f"{pid}: s_norm is inconsistent with vertex-anchored d_mm"
+                )
 
         prob, mask = run_patient(model, mr, device, args.threshold)
-        dice = dice_per_slice(mask, bone)
+        dice_slices = dice_per_slice(mask, bone)
+        dice_3d = dice_volume(mask, bone)
 
-        np.savez_compressed(
-            out_dir / f"{pid}.npz",
+        output = dict(
             mr=mr, bone=bone, prob=prob, mask=mask,
             s_norm=s_norm, z_index=z_index,
         )
+        if d_mm is not None:
+            output["d_mm"] = d_mm.astype(np.float32)
+        if vertex_z is not None:
+            output["vertex_z"] = np.asarray(vertex_z).astype(np.int16)
+        np.savez_compressed(out_dir / f"{pid}.npz", **output)
+
         rows.append({
             "patient": pid, "split": pid_split[pid], "n_slices": int(mr.shape[0]),
-            "dice_mean": round(float(dice.mean()), 4),
+            "dice_slice_mean": round(float(dice_slices.mean()), 6),
+            "dice_volume": round(float(dice_3d), 6),
             "bone_frac_gt": round(float(bone.mean()), 5),
             "bone_frac_pred": round(float(mask.mean()), 5),
         })
         print(f"[{i:3d}/{len(pids)}] {pid:8s} split={pid_split[pid]:6s} "
-              f"S={mr.shape[0]:3d}  dice={dice.mean():.4f}")
+              f"S={mr.shape[0]:3d}  slice_dice={dice_slices.mean():.4f}  "
+              f"volume_dice={dice_3d:.4f}")
 
-    fields = ["patient", "split", "n_slices", "dice_mean", "bone_frac_gt", "bone_frac_pred"]
+    fields = ["patient", "split", "n_slices", "dice_slice_mean", "dice_volume",
+              "bone_frac_gt", "bone_frac_pred"]
     with open(out_dir / "summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
 
-    overall = np.array([r["dice_mean"] for r in rows])
+    overall_slice = np.array([r["dice_slice_mean"] for r in rows])
+    overall_volume = np.array([r["dice_volume"] for r in rows])
     by_split = {}
     for sp in sorted(set(pid_split.values())):
-        vals = np.array([r["dice_mean"] for r in rows if r["split"] == sp])
-        if vals.size == 0:
+        slice_vals = np.array([r["dice_slice_mean"] for r in rows if r["split"] == sp])
+        volume_vals = np.array([r["dice_volume"] for r in rows if r["split"] == sp])
+        if slice_vals.size == 0:
             continue
         by_split[sp] = {
-            "n_patients": int(vals.size),
-            "dice_mean": float(vals.mean()),
-            "dice_std": float(vals.std(ddof=1)) if vals.size > 1 else 0.0,
-            "dice_ci95": ci95(vals),
+            "n_patients": int(slice_vals.size),
+            "dice_slice_mean": float(slice_vals.mean()),
+            "dice_slice_std": float(slice_vals.std(ddof=1)) if slice_vals.size > 1 else 0.0,
+            "dice_slice_ci95": ci95(slice_vals),
+            "dice_volume_mean": float(volume_vals.mean()),
+            "dice_volume_std": float(volume_vals.std(ddof=1)) if volume_vals.size > 1 else 0.0,
+            "dice_volume_ci95": ci95(volume_vals),
         }
 
     summary = {
         "checkpoint": str(ckpt_path),
+        "checkpoint_sha256": sha256(ckpt_path),
         "checkpoint_epoch": ckpt.get("epoch"),
         "checkpoint_val_dice": ckpt.get("val_dice"),
         "data_dir": str(args.data_dir),
         "threshold": args.threshold,
         "n_patients": len(rows),
         "overall": {
-            "dice_mean": float(overall.mean()),
-            "dice_std": float(overall.std(ddof=1)) if overall.size > 1 else 0.0,
-            "dice_ci95": ci95(overall),
+            "dice_slice_mean": float(overall_slice.mean()),
+            "dice_slice_std": float(overall_slice.std(ddof=1)) if overall_slice.size > 1 else 0.0,
+            "dice_slice_ci95": ci95(overall_slice),
+            "dice_volume_mean": float(overall_volume.mean()),
+            "dice_volume_std": float(overall_volume.std(ddof=1)) if overall_volume.size > 1 else 0.0,
+            "dice_volume_ci95": ci95(overall_volume),
         },
         "by_split": by_split,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
     print("-" * 60)
-    print(f"patients={len(rows)}  overall patient-mean Dice="
-          f"{summary['overall']['dice_mean']:.4f} +/- {summary['overall']['dice_ci95']:.4f} (95% CI)")
+    print(f"patients={len(rows)}  patient-mean volume Dice="
+          f"{summary['overall']['dice_volume_mean']:.4f} +/- "
+          f"{summary['overall']['dice_volume_ci95']:.4f} (95% CI)")
     for sp, s in by_split.items():
-        print(f"  {sp:6s} n={s['n_patients']:3d}  dice={s['dice_mean']:.4f} +/- {s['dice_ci95']:.4f}")
+        print(f"  {sp:6s} n={s['n_patients']:3d}  "
+              f"slice_dice={s['dice_slice_mean']:.4f}  "
+              f"volume_dice={s['dice_volume_mean']:.4f} +/- "
+              f"{s['dice_volume_ci95']:.4f}")
     print(f"predictions -> {out_dir}")
 
 
