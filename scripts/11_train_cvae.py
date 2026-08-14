@@ -5,8 +5,10 @@
 Train an s_norm-conditioned convolutional VAE on filtered training bone masks.
 
 The model learns a soft joint shape prior P(bone | z, s_norm) for MetaCOG.
-It never sees MR or U-Net outputs. Validation selects the checkpoint by
-reconstruction soft Dice (encode→decode with latent mean).
+It never sees MR or U-Net outputs. After β warm-up, validation selects the
+checkpoint by reconstruction soft Dice (encode→decode with latent mean).
+Warm-up epochs are skipped so best.pt is a usable N(0,I) prior, not an
+unregularized autoencoder.
 
 Loss = weighted BCE + soft Dice + β · KL(q(z|B,s) || N(0,I)), with optional
 linear β warm-up.
@@ -166,7 +168,7 @@ def pick_device(choice: str) -> torch.device:
 def evaluate(model, loader, loss_fn, device, beta: float) -> dict:
     model.eval()
     tot_loss = tot_soft = tot_hard = tot_kl = n = 0
-    tot_mu_norm = tot_logvar = 0.0
+    tot_mu_norm = tot_logvar = tot_prior = 0.0
     for bone, s_norm in loader:
         bone = bone.to(device)
         s_norm = s_norm.to(device)
@@ -174,6 +176,8 @@ def evaluate(model, loader, loss_fn, device, beta: float) -> dict:
         logits = model.decode(mu, s_norm)  # deterministic recon for metrics
         loss, _, _, kl = loss_fn(logits, bone, mu, logvar, beta)
         probs = torch.sigmoid(logits)
+        z_prior = torch.randn_like(mu)
+        prior_probs = torch.sigmoid(model.decode(z_prior, s_norm))
         bs = bone.size(0)
         tot_loss += float(loss) * bs
         tot_soft += soft_dice(probs, bone) * bs
@@ -181,6 +185,7 @@ def evaluate(model, loader, loss_fn, device, beta: float) -> dict:
         tot_kl += float(kl) * bs
         tot_mu_norm += float(mu.pow(2).mean().sqrt()) * bs
         tot_logvar += float(logvar.mean()) * bs
+        tot_prior += soft_dice(prior_probs, bone) * bs
         n += bs
     return {
         "loss": tot_loss / n,
@@ -189,6 +194,7 @@ def evaluate(model, loader, loss_fn, device, beta: float) -> dict:
         "kl": tot_kl / n,
         "mu_rms": tot_mu_norm / n,
         "logvar_mean": tot_logvar / n,
+        "prior_soft_dice": tot_prior / n,
     }
 
 
@@ -543,6 +549,7 @@ def main() -> None:
               f"val_loss={val_metrics['loss']:.4f}  "
               f"val_soft_dice={val_metrics['soft_dice']:.4f}  "
               f"val_hard_dice={val_metrics['hard_dice']:.4f}  "
+              f"val_prior_dice={val_metrics['prior_soft_dice']:.4f}  "
               f"val_kl={val_metrics['kl']:.4f}  ({dt:.1f}s)")
 
         log_payload = {
@@ -558,6 +565,7 @@ def main() -> None:
             "val/soft_dice": val_metrics["soft_dice"],
             "val/hard_dice": val_metrics["hard_dice"],
             "val/kl": val_metrics["kl"],
+            "val/prior_soft_dice": val_metrics["prior_soft_dice"],
             "latent/mu_rms": val_metrics["mu_rms"],
             "latent/logvar_mean": val_metrics["logvar_mean"],
             "time/epoch_sec": dt,
@@ -590,12 +598,16 @@ def main() -> None:
             "epoch": epoch,
             "val_soft_dice": val_metrics["soft_dice"],
             "val_hard_dice": val_metrics["hard_dice"],
+            "val_prior_soft_dice": val_metrics["prior_soft_dice"],
             "val_kl": val_metrics["kl"],
             "beta": beta,
             "config": vars(args),
             "pos_weight": pos_weight,
         }
-        if val_metrics["soft_dice"] > best_soft:
+        # Recon Dice peaks during β warm-up when q(z|x) is far from N(0,I).
+        # Only promote best.pt after annealing so the saved decoder is a usable prior.
+        annealed = args.beta_anneal <= 0 or epoch >= args.beta_anneal
+        if annealed and val_metrics["soft_dice"] > best_soft:
             best_soft = val_metrics["soft_dice"]
             torch.save(payload, out_dir / "best.pt")
             if run is not None:
