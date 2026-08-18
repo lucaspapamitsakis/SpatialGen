@@ -24,3 +24,7 @@ wandb/
 # Handoff Documents
 PROJECT_HANDOFF.md
 HANDOFF_*.md
+
+cursor_c_vae_training_and_evaluation.md
+
+posters/
